@@ -663,6 +663,16 @@ class ReqLogprob:
     output_token_ids_logprobs_idx: Optional[list] = None
 
 
+@dataclasses.dataclass
+class PendingSample:
+    batch: Any
+    result: Any
+    forward_batch: Any
+    wait_for_rids: Optional[Set[str]] = None
+    external_params_required: bool = False
+    external_params: Optional[Dict[str, Any]] = None
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -723,6 +733,7 @@ class Req(ReqDllmMixin):
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
+        self.pending_sample: Optional[PendingSample] = None
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by _refresh_fill_ids; admission only updates
         # extend_range, never mutates this array's length.
@@ -2706,6 +2717,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
+                and self.reqs[i].pending_sample is None
                 and self.reqs[i] not in chunked_req_to_exclude
             ]
 

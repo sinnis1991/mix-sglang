@@ -56,6 +56,8 @@ class GenerationBatchResult:
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
+    pending_sample: bool = False
+    forward_batch: Optional[Any] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
 

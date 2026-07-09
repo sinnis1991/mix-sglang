@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 
 class BaseTpWorker(ABC):
     @abstractmethod
-    def forward_batch_generation(self, forward_batch: ForwardBatch):
+    def forward_batch_generation(self, forward_batch: ForwardBatch, **kwargs):
         pass
 
     @property
@@ -486,6 +486,7 @@ class TpModelWorker(BaseTpWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
+        skip_sample: bool = False,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
         if batch is not None:
@@ -519,6 +520,15 @@ class TpModelWorker(BaseTpWorker):
 
             if is_verify:
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
+                return batch_result
+
+            if (
+                skip_sample
+                and not self.enable_spec
+                and not forward_batch.is_prefill_only
+            ):
+                batch_result.pending_sample = True
+                batch_result.forward_batch = forward_batch
                 return batch_result
 
             if (

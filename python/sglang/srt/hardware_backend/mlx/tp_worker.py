@@ -99,6 +99,7 @@ class MlxTpModelWorker(TpModelWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
+        skip_sample: bool = False,
     ) -> GenerationBatchResult:
         """Override to route through MLX model runner."""
         if batch is not None:
@@ -112,6 +113,7 @@ class MlxTpModelWorker(TpModelWorker):
             pp_proxy_tensors,
             is_verify,
             skip_attn_backend_init,
+            skip_sample=skip_sample,
         )
 
     def _cleanup_stale_rids(self, forward_mode, current_rids: set[str]) -> None:

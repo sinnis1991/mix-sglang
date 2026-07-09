@@ -166,6 +166,7 @@ from sglang.srt.managers.prefill_delayer import (
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
+    PendingSample,
     Req,
     ScheduleBatch,
 )
@@ -973,6 +974,7 @@ class Scheduler(
         self.cur_batch: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
+        self.pending_sample_reqs: List[Req] = []
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
@@ -1531,6 +1533,8 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            self.run_pending_sample_stage()
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1569,6 +1573,8 @@ class Scheduler(
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+
+            self.run_pending_sample_stage()
 
             self._apply_war_barrier()
 
@@ -3295,7 +3301,7 @@ class Scheduler(
                 )
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.model_worker.forward_batch_generation(
-                    batch, **kwargs
+                    batch, skip_sample=True, **kwargs
                 )
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
@@ -3402,12 +3408,133 @@ class Scheduler(
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None
 
+    def _park_pending_sample_result(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> bool:
+        if not result.pending_sample:
+            return False
+
+        pending_batch = batch.copy()
+        for req in pending_batch.reqs:
+            custom_params = req.sampling_params.custom_params
+            wait_for_rids = None
+            external_params_required = False
+            if isinstance(custom_params, dict):
+                wait_for = custom_params.get("__pds_wait_for_rids")
+                if wait_for:
+                    wait_for_rids = (
+                        {wait_for} if isinstance(wait_for, str) else set(wait_for)
+                    )
+                external_params_required = bool(
+                    custom_params.get("__pds_external_sample_params_required", False)
+                )
+
+            req.pending_sample = PendingSample(
+                batch=pending_batch,
+                result=result,
+                forward_batch=result.forward_batch,
+                wait_for_rids=wait_for_rids,
+                external_params_required=external_params_required,
+            )
+            if req not in self.pending_sample_reqs:
+                self.pending_sample_reqs.append(req)
+
+        return True
+
+    def _pending_sample_ready(self, req: Req) -> bool:
+        pending = req.pending_sample
+        if pending is None:
+            return False
+
+        if pending.external_params_required and pending.external_params is None:
+            return False
+
+        if pending.wait_for_rids:
+            pending_rids = {
+                other.rid
+                for other in self.pending_sample_reqs
+                if other.pending_sample is not None
+            }
+            if not pending.wait_for_rids.issubset(pending_rids):
+                return False
+
+        return True
+
+    def run_pending_sample_stage(self) -> None:
+        if not self.pending_sample_reqs:
+            return
+
+        ready_reqs = [
+            req for req in self.pending_sample_reqs if self._pending_sample_ready(req)
+        ]
+        if not ready_reqs:
+            return
+
+        ready_result_ids = {id(req.pending_sample.result) for req in ready_reqs}
+        for result_id in list(ready_result_ids):
+            group_reqs = [
+                req
+                for req in self.pending_sample_reqs
+                if req.pending_sample is not None
+                and id(req.pending_sample.result) == result_id
+            ]
+            if not group_reqs or not all(
+                self._pending_sample_ready(req) for req in group_reqs
+            ):
+                continue
+
+            pending = group_reqs[0].pending_sample
+            batch = pending.batch
+            result = pending.result
+            forward_batch = pending.forward_batch
+
+            result.next_token_ids = self.model_worker.model_runner.sample(
+                result.logits_output, forward_batch
+            )
+            result.pending_sample = False
+            result.forward_batch = None
+
+            for req in group_reqs:
+                req.pending_sample = None
+                if req in self.pending_sample_reqs:
+                    self.pending_sample_reqs.remove(req)
+
+            self.process_batch_result(batch, result)
+            self._maybe_admit_sampled_batch(batch)
+
+    def _maybe_admit_sampled_batch(self, batch: ScheduleBatch) -> None:
+        if batch.is_empty():
+            return
+
+        already_tracked = False
+        if self.last_batch is not None:
+            already_tracked = any(req in self.last_batch.reqs for req in batch.reqs)
+        already_tracked = already_tracked or any(
+            req in self.running_batch.reqs for req in batch.reqs
+        )
+        if already_tracked:
+            return
+
+        batch.filter_batch()
+        if batch.is_empty():
+            return
+
+        if self.running_batch.is_empty():
+            self.running_batch = batch
+        else:
+            self.running_batch.merge_batch(batch)
+
     @scheduler_nvtx_method("scheduler.process_batch_result")
     def process_batch_result(
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if isinstance(result, GenerationBatchResult) and self._park_pending_sample_result(
+            batch, result
+        ):
+            return
+
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
         if batch.forward_mode.is_decode():
