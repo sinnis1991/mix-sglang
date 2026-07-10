@@ -666,6 +666,7 @@ class ReqLogprob:
 @dataclasses.dataclass
 class PendingSample:
     batch: Any
+    active_batch: Any
     result: Any
     forward_batch: Any
     wait_for_rids: Optional[Set[str]] = None

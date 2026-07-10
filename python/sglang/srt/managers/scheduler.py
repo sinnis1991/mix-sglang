@@ -3431,6 +3431,7 @@ class Scheduler(
 
             req.pending_sample = PendingSample(
                 batch=pending_batch,
+                active_batch=batch,
                 result=result,
                 forward_batch=result.forward_batch,
                 wait_for_rids=wait_for_rids,
@@ -3442,23 +3443,7 @@ class Scheduler(
         return True
 
     def _pending_sample_ready(self, req: Req) -> bool:
-        pending = req.pending_sample
-        if pending is None:
-            return False
-
-        if pending.external_params_required and pending.external_params is None:
-            return False
-
-        if pending.wait_for_rids:
-            pending_rids = {
-                other.rid
-                for other in self.pending_sample_reqs
-                if other.pending_sample is not None
-            }
-            if not pending.wait_for_rids.issubset(pending_rids):
-                return False
-
-        return True
+        return req.pending_sample is not None
 
     def run_pending_sample_stage(self) -> None:
         if not self.pending_sample_reqs:
@@ -3485,12 +3470,58 @@ class Scheduler(
 
             pending = group_reqs[0].pending_sample
             batch = pending.batch
+            active_batch = pending.active_batch
             result = pending.result
             forward_batch = pending.forward_batch
+            num_reqs = active_batch.req_pool_indices.numel()
+
+            if (
+                result.logits_output is not None
+                and result.logits_output.next_token_logits is not None
+                and result.logits_output.next_token_logits.shape[0]
+                != num_reqs
+                and forward_batch.forward_mode.is_extend()
+                and forward_batch.extend_start_loc is not None
+                and forward_batch.extend_seq_lens is not None
+            ):
+                last_token_indices = (
+                    forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+                ).to(result.logits_output.next_token_logits.device)
+                result.logits_output.next_token_logits = (
+                    result.logits_output.next_token_logits[last_token_indices]
+                )
+                if result.logits_output.hidden_states is not None:
+                    result.logits_output.hidden_states = result.logits_output.hidden_states[
+                        last_token_indices
+                    ]
 
             result.next_token_ids = self.model_worker.model_runner.sample(
                 result.logits_output, forward_batch
             )
+            if (
+                result.next_token_ids is not None
+                and result.next_token_ids.numel() != num_reqs
+            ):
+                if (
+                    forward_batch.forward_mode.is_extend()
+                    and forward_batch.extend_start_loc is not None
+                    and forward_batch.extend_seq_lens is not None
+                ):
+                    last_token_indices = (
+                        forward_batch.extend_start_loc
+                        + forward_batch.extend_seq_lens
+                        - 1
+                    ).to(result.next_token_ids.device)
+                else:
+                    last_token_indices = torch.full(
+                        (num_reqs,),
+                        result.next_token_ids.numel() - 1,
+                        dtype=torch.long,
+                        device=result.next_token_ids.device,
+                    )
+                result.next_token_ids = result.next_token_ids[last_token_indices]
+            self._relay_forward_payload(active_batch.req_pool_indices, result)
+            active_batch.input_ids = None
             result.pending_sample = False
             result.forward_batch = None
 
@@ -3500,7 +3531,7 @@ class Scheduler(
                     self.pending_sample_reqs.remove(req)
 
             self.process_batch_result(batch, result)
-            self._maybe_admit_sampled_batch(batch)
+            self._maybe_admit_sampled_batch(active_batch)
 
     def _maybe_admit_sampled_batch(self, batch: ScheduleBatch) -> None:
         if batch.is_empty():
