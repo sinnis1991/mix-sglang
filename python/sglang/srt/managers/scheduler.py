@@ -25,7 +25,7 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
@@ -3408,13 +3408,44 @@ class Scheduler(
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None
 
+    def _copy_pending_sample_admit_batch(self, batch: ScheduleBatch) -> ScheduleBatch:
+        pending_batch = batch.copy()
+        pending_batch.token_to_kv_pool_allocator = batch.token_to_kv_pool_allocator
+        pending_batch.tree_cache = batch.tree_cache
+        pending_batch.device = batch.device
+        pending_batch.batch_is_full = batch.batch_is_full
+        pending_batch.has_grammar = batch.has_grammar
+        pending_batch.return_hidden_states = batch.return_hidden_states
+        pending_batch.req_pool_indices_cpu = batch.req_pool_indices_cpu
+        pending_batch.seq_lens = batch.seq_lens
+        pending_batch.orig_seq_lens = batch.orig_seq_lens
+        pending_batch.seq_lens_cpu = batch.seq_lens_cpu
+        pending_batch.top_logprobs_nums = (
+            batch.top_logprobs_nums[:] if batch.top_logprobs_nums is not None else None
+        )
+        pending_batch.token_ids_logprobs = (
+            batch.token_ids_logprobs[:] if batch.token_ids_logprobs is not None else None
+        )
+        pending_batch.extend_logprob_start_lens = (
+            batch.extend_logprob_start_lens[:]
+            if batch.extend_logprob_start_lens is not None
+            else None
+        )
+        pending_batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            pending_batch, self.model_config.vocab_size
+        )
+        return pending_batch
+
     def _park_pending_sample_result(
         self, batch: ScheduleBatch, result: GenerationBatchResult
     ) -> bool:
         if not result.pending_sample:
             return False
 
-        pending_batch = batch.copy()
+        pending_batch = self._copy_pending_sample_admit_batch(batch)
+        batch.input_ids = None
+        batch.prefill_input_ids_cpu = None
+        batch.mix_running_indices = None
         for req in pending_batch.reqs:
             custom_params = req.sampling_params.custom_params
             wait_for_rids = None
@@ -3431,7 +3462,7 @@ class Scheduler(
 
             req.pending_sample = PendingSample(
                 batch=pending_batch,
-                active_batch=batch,
+                active_batch=pending_batch,
                 result=result,
                 forward_batch=result.forward_batch,
                 wait_for_rids=wait_for_rids,
@@ -3442,15 +3473,73 @@ class Scheduler(
 
         return True
 
-    def _pending_sample_ready(self, req: Req) -> bool:
-        return req.pending_sample is not None
+    def _collect_active_req_rids(self) -> Set[str]:
+        active_rids: Set[str] = set()
+
+        for req in self.pending_sample_reqs:
+            active_rids.add(req.rid)
+
+        for req in self.waiting_queue:
+            active_rids.add(req.rid)
+
+        for batch in (self.cur_batch, self.running_batch, self.last_batch):
+            if batch is None:
+                continue
+            for req in batch.reqs:
+                active_rids.add(req.rid)
+
+        return active_rids
+
+    def _pending_sample_ready(
+        self,
+        req: Req,
+        pending_rids_snapshot: Optional[Set[str]] = None,
+        active_rids_snapshot: Optional[Set[str]] = None,
+    ) -> bool:
+        pending = req.pending_sample
+        if pending is None:
+            return False
+
+        if pending.external_params_required and pending.external_params is None:
+            return False
+
+        if pending.wait_for_rids:
+            pending_rids = (
+                pending_rids_snapshot
+                if pending_rids_snapshot is not None
+                else {
+                    other.rid
+                    for other in self.pending_sample_reqs
+                    if other.pending_sample is not None
+                }
+            )
+            active_rids = (
+                active_rids_snapshot
+                if active_rids_snapshot is not None
+                else self._collect_active_req_rids()
+            )
+            waiting_for_live_rids = pending.wait_for_rids.intersection(active_rids)
+            if not waiting_for_live_rids.issubset(pending_rids):
+                return False
+
+        return True
 
     def run_pending_sample_stage(self) -> None:
         if not self.pending_sample_reqs:
             return
 
+        pending_rids_snapshot = {
+            req.rid
+            for req in self.pending_sample_reqs
+            if req.pending_sample is not None
+        }
+        active_rids_snapshot = self._collect_active_req_rids()
         ready_reqs = [
-            req for req in self.pending_sample_reqs if self._pending_sample_ready(req)
+            req
+            for req in self.pending_sample_reqs
+            if self._pending_sample_ready(
+                req, pending_rids_snapshot, active_rids_snapshot
+            )
         ]
         if not ready_reqs:
             return
@@ -3464,7 +3553,10 @@ class Scheduler(
                 and id(req.pending_sample.result) == result_id
             ]
             if not group_reqs or not all(
-                self._pending_sample_ready(req) for req in group_reqs
+                self._pending_sample_ready(
+                    req, pending_rids_snapshot, active_rids_snapshot
+                )
+                for req in group_reqs
             ):
                 continue
 
@@ -3522,6 +3614,8 @@ class Scheduler(
                 result.next_token_ids = result.next_token_ids[last_token_indices]
             self._relay_forward_payload(active_batch.req_pool_indices, result)
             active_batch.input_ids = None
+            active_batch.is_extend_in_batch = False
+            active_batch.all_extend_in_batch = False
             result.pending_sample = False
             result.forward_batch = None
 
@@ -3698,6 +3792,7 @@ class Scheduler(
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
+        idle &= len(self.pending_sample_reqs) == 0
 
         if not for_health_check:
             # Grammar queue and prefill inflight queue may not produce batch
