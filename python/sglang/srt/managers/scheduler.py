@@ -3449,6 +3449,9 @@ class Scheduler(
         for req in pending_batch.reqs:
             custom_params = req.sampling_params.custom_params
             wait_for_rids = None
+            sample_group = None
+            fuse_method = None
+            fuse_weight = 1.0
             external_params_required = False
             if isinstance(custom_params, dict):
                 wait_for = custom_params.get("__pds_wait_for_rids")
@@ -3456,6 +3459,9 @@ class Scheduler(
                     wait_for_rids = (
                         {wait_for} if isinstance(wait_for, str) else set(wait_for)
                     )
+                sample_group = custom_params.get("__pds_sample_group")
+                fuse_method = custom_params.get("__pds_fuse_method")
+                fuse_weight = float(custom_params.get("__pds_fuse_weight", 1.0))
                 external_params_required = bool(
                     custom_params.get("__pds_external_sample_params_required", False)
                 )
@@ -3466,6 +3472,9 @@ class Scheduler(
                 result=result,
                 forward_batch=result.forward_batch,
                 wait_for_rids=wait_for_rids,
+                sample_group=sample_group,
+                fuse_method=fuse_method,
+                fuse_weight=fuse_weight,
                 external_params_required=external_params_required,
             )
             if req not in self.pending_sample_reqs:
@@ -3476,19 +3485,34 @@ class Scheduler(
     def _collect_active_req_rids(self) -> Set[str]:
         active_rids: Set[str] = set()
 
-        for req in self.pending_sample_reqs:
+        for req in self._iter_active_reqs():
             active_rids.add(req.rid)
 
+        return active_rids
+
+    def _iter_active_reqs(self):
+        for req in self.pending_sample_reqs:
+            yield req
+
         for req in self.waiting_queue:
-            active_rids.add(req.rid)
+            yield req
 
         for batch in (self.cur_batch, self.running_batch, self.last_batch):
             if batch is None:
                 continue
             for req in batch.reqs:
-                active_rids.add(req.rid)
+                yield req
 
-        return active_rids
+    def _collect_live_sample_group_rids(self, sample_group: str) -> Set[str]:
+        group_rids: Set[str] = set()
+        for req in self._iter_active_reqs():
+            custom_params = req.sampling_params.custom_params
+            if (
+                isinstance(custom_params, dict)
+                and custom_params.get("__pds_sample_group") == sample_group
+            ):
+                group_rids.add(req.rid)
+        return group_rids
 
     def _pending_sample_ready(
         self,
@@ -3522,7 +3546,324 @@ class Scheduler(
             if not waiting_for_live_rids.issubset(pending_rids):
                 return False
 
+        if pending.sample_group:
+            pending_rids = (
+                pending_rids_snapshot
+                if pending_rids_snapshot is not None
+                else {
+                    other.rid
+                    for other in self.pending_sample_reqs
+                    if other.pending_sample is not None
+                }
+            )
+            live_group_rids = self._collect_live_sample_group_rids(
+                pending.sample_group
+            )
+            if not live_group_rids.issubset(pending_rids):
+                return False
+
         return True
+
+    def _pds_result_reqs(self, result: GenerationBatchResult) -> List[Req]:
+        return [
+            req
+            for req in self.pending_sample_reqs
+            if req.pending_sample is not None and req.pending_sample.result is result
+        ]
+
+    def _normalize_pending_sample_logits(self, pending: PendingSample) -> None:
+        result = pending.result
+        forward_batch = pending.forward_batch
+        active_batch = pending.active_batch
+        num_reqs = active_batch.req_pool_indices.numel()
+
+        if (
+            result.logits_output is not None
+            and result.logits_output.next_token_logits is not None
+            and result.logits_output.next_token_logits.shape[0] != num_reqs
+            and forward_batch.forward_mode.is_extend()
+            and forward_batch.extend_start_loc is not None
+            and forward_batch.extend_seq_lens is not None
+        ):
+            last_token_indices = (
+                forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+            ).to(result.logits_output.next_token_logits.device)
+            result.logits_output.next_token_logits = (
+                result.logits_output.next_token_logits[last_token_indices]
+            )
+            if result.logits_output.hidden_states is not None:
+                result.logits_output.hidden_states = result.logits_output.hidden_states[
+                    last_token_indices
+                ]
+
+    def _pds_req_index(self, req: Req) -> int:
+        return req.pending_sample.active_batch.reqs.index(req)
+
+    def _pds_distribution_for_req(self, req: Req) -> torch.Tensor:
+        pending = req.pending_sample
+        self._normalize_pending_sample_logits(pending)
+
+        logits = pending.result.logits_output.next_token_logits[
+            self._pds_req_index(req)
+        ].float()
+        params = req.sampling_params
+        logits = logits / params.temperature
+        probs = torch.softmax(logits, dim=-1)
+
+        if params.top_k == 1:
+            filtered = torch.zeros_like(probs)
+            filtered[torch.argmax(probs)] = 1.0
+            return filtered
+
+        sorted_probs, sorted_idx = probs.sort(dim=-1, descending=True)
+        token_positions = torch.arange(
+            sorted_probs.shape[-1], device=sorted_probs.device
+        )
+        sorted_probs[token_positions >= params.top_k] = 0.0
+        sorted_probs[(torch.cumsum(sorted_probs, dim=-1) - sorted_probs) > params.top_p] = (
+            0.0
+        )
+        if params.min_p > 0:
+            sorted_probs[sorted_probs < sorted_probs[0] * params.min_p] = 0.0
+
+        denom = sorted_probs.sum()
+        if denom <= 0:
+            filtered = probs
+        else:
+            filtered = torch.zeros_like(probs).scatter(
+                dim=-1, index=sorted_idx, src=sorted_probs / denom
+            )
+        return filtered
+
+    def _sample_from_fused_probs(
+        self, fused_probs: torch.Tensor, reqs: List[Req]
+    ) -> torch.Tensor:
+        if all(req.sampling_params.top_k == 1 for req in reqs):
+            return torch.argmax(fused_probs).view(1).to(torch.int32)
+
+        # TODO(PDS): support per-request sampling kernels and deterministic seeds
+        # when fused-group sampling params intentionally diverge.
+        return torch.multinomial(fused_probs, num_samples=1).view(1).to(torch.int32)
+
+    def _run_fused_pending_sample_group(self, group_reqs: List[Req]) -> Set[int]:
+        if len(group_reqs) < 2:
+            return set()
+
+        result_reqs_by_id: Dict[int, List[Req]] = {}
+        for req in group_reqs:
+            result_reqs_by_id.setdefault(id(req.pending_sample.result), []).append(req)
+        result_ids = set(result_reqs_by_id)
+        group_req_ids = {id(req) for req in group_reqs}
+        for req in group_reqs:
+            result_reqs = self._pds_result_reqs(req.pending_sample.result)
+            if any(id(result_req) not in group_req_ids for result_req in result_reqs):
+                return set()
+
+        fuse_method = group_reqs[0].pending_sample.fuse_method
+        if fuse_method != "avg_probs":
+            return set()
+
+        distributions = []
+        weights = []
+        for req in group_reqs:
+            distributions.append(self._pds_distribution_for_req(req))
+            weights.append(req.pending_sample.fuse_weight)
+
+        probs = torch.stack(distributions, dim=0)
+        weight_tensor = torch.tensor(
+            weights, dtype=probs.dtype, device=probs.device
+        ).view(-1, 1)
+        weight_sum = weight_tensor.sum()
+        if weight_sum <= 0:
+            weight_tensor = torch.ones_like(weight_tensor)
+            weight_sum = weight_tensor.sum()
+        fused_probs = (probs * weight_tensor).sum(dim=0) / weight_sum
+        fused_probs = fused_probs / fused_probs.sum()
+        sampled_token = self._sample_from_fused_probs(fused_probs, group_reqs)
+
+        for result_id, result_reqs in result_reqs_by_id.items():
+            result = result_reqs[0].pending_sample.result
+            num_reqs = result_reqs[0].pending_sample.active_batch.req_pool_indices.numel()
+            result.next_token_ids = torch.empty(
+                (num_reqs,), dtype=sampled_token.dtype, device=sampled_token.device
+            )
+            for req in result_reqs:
+                result.next_token_ids[self._pds_req_index(req)] = sampled_token[0]
+
+        processed_result_ids = set()
+        for result_id, result_reqs in result_reqs_by_id.items():
+            self._finalize_pending_sample_result(result_reqs)
+            processed_result_ids.add(result_id)
+
+        return processed_result_ids
+
+    def _sample_pending_result_in_place(self, pending: PendingSample) -> None:
+        active_batch = pending.active_batch
+        result = pending.result
+        forward_batch = pending.forward_batch
+        num_reqs = active_batch.req_pool_indices.numel()
+
+        self._normalize_pending_sample_logits(pending)
+
+        result.next_token_ids = self.model_worker.model_runner.sample(
+            result.logits_output, forward_batch
+        )
+        if (
+            result.next_token_ids is not None
+            and result.next_token_ids.numel() != num_reqs
+        ):
+            if (
+                forward_batch.forward_mode.is_extend()
+                and forward_batch.extend_start_loc is not None
+                and forward_batch.extend_seq_lens is not None
+            ):
+                last_token_indices = (
+                    forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+                ).to(result.next_token_ids.device)
+            else:
+                last_token_indices = torch.full(
+                    (num_reqs,),
+                    result.next_token_ids.numel() - 1,
+                    dtype=torch.long,
+                    device=result.next_token_ids.device,
+                )
+            result.next_token_ids = result.next_token_ids[last_token_indices]
+
+    def _run_ready_fused_sample_groups(
+        self,
+        ready_reqs: List[Req],
+        pending_rids_snapshot: Set[str],
+        active_rids_snapshot: Set[str],
+    ) -> Set[int]:
+        processed_result_ids: Set[int] = set()
+        eligible_groups: Dict[str, List[Req]] = {}
+        candidate_groups = {
+            req.pending_sample.sample_group
+            for req in ready_reqs
+            if req.pending_sample is not None
+            and req.pending_sample.sample_group
+            and req.pending_sample.fuse_method == "avg_probs"
+        }
+        for sample_group in candidate_groups:
+            group_reqs = [
+                req
+                for req in self.pending_sample_reqs
+                if req.pending_sample is not None
+                and req.pending_sample.sample_group == sample_group
+            ]
+            if not group_reqs or not all(
+                self._pending_sample_ready(
+                    req, pending_rids_snapshot, active_rids_snapshot
+                )
+                for req in group_reqs
+            ):
+                continue
+            if len(group_reqs) < 2:
+                continue
+            eligible_groups[sample_group] = group_reqs
+
+        if not eligible_groups:
+            return processed_result_ids
+
+        result_reqs_by_id: Dict[int, List[Req]] = {}
+        for group_reqs in eligible_groups.values():
+            for req in group_reqs:
+                result_reqs_by_id.setdefault(
+                    id(req.pending_sample.result),
+                    self._pds_result_reqs(req.pending_sample.result),
+                )
+
+        for result_reqs in result_reqs_by_id.values():
+            for req in result_reqs:
+                if not self._pending_sample_ready(
+                    req, pending_rids_snapshot, active_rids_snapshot
+                ):
+                    return processed_result_ids
+                pending = req.pending_sample
+                if (
+                    pending.sample_group
+                    and pending.fuse_method == "avg_probs"
+                    and pending.sample_group not in eligible_groups
+                ):
+                    return processed_result_ids
+
+        sampled_tokens: Dict[str, torch.Tensor] = {}
+        for sample_group, group_reqs in eligible_groups.items():
+            fuse_method = group_reqs[0].pending_sample.fuse_method
+            if fuse_method != "avg_probs":
+                continue
+
+            distributions = []
+            weights = []
+            for req in group_reqs:
+                distributions.append(self._pds_distribution_for_req(req))
+                weights.append(req.pending_sample.fuse_weight)
+
+            probs = torch.stack(distributions, dim=0)
+            weight_tensor = torch.tensor(
+                weights, dtype=probs.dtype, device=probs.device
+            ).view(-1, 1)
+            weight_sum = weight_tensor.sum()
+            if weight_sum <= 0:
+                weight_tensor = torch.ones_like(weight_tensor)
+                weight_sum = weight_tensor.sum()
+            fused_probs = (probs * weight_tensor).sum(dim=0) / weight_sum
+            fused_probs = fused_probs / fused_probs.sum()
+            sampled_tokens[sample_group] = self._sample_from_fused_probs(
+                fused_probs, group_reqs
+            )
+
+        if not sampled_tokens:
+            return processed_result_ids
+
+        covered_req_ids = {
+            id(req) for group_reqs in eligible_groups.values() for req in group_reqs
+        }
+        default_sampled_token = next(iter(sampled_tokens.values()))
+        for result_reqs in result_reqs_by_id.values():
+            result = result_reqs[0].pending_sample.result
+            num_reqs = result_reqs[0].pending_sample.active_batch.req_pool_indices.numel()
+            if any(id(req) not in covered_req_ids for req in result_reqs):
+                self._sample_pending_result_in_place(result_reqs[0].pending_sample)
+            else:
+                result.next_token_ids = torch.empty(
+                    (num_reqs,),
+                    dtype=default_sampled_token.dtype,
+                    device=default_sampled_token.device,
+                )
+
+        for sample_group, group_reqs in eligible_groups.items():
+            sampled_token = sampled_tokens[sample_group]
+            for req in group_reqs:
+                req.pending_sample.result.next_token_ids[
+                    self._pds_req_index(req)
+                ] = sampled_token[0]
+
+        for result_id, result_reqs in result_reqs_by_id.items():
+            self._finalize_pending_sample_result(result_reqs)
+            processed_result_ids.add(result_id)
+        return processed_result_ids
+
+    def _finalize_pending_sample_result(self, group_reqs: List[Req]) -> None:
+        pending = group_reqs[0].pending_sample
+        batch = pending.batch
+        active_batch = pending.active_batch
+        result = pending.result
+
+        self._relay_forward_payload(active_batch.req_pool_indices, result)
+        active_batch.input_ids = None
+        active_batch.is_extend_in_batch = False
+        active_batch.all_extend_in_batch = False
+        result.pending_sample = False
+        result.forward_batch = None
+
+        for req in group_reqs:
+            req.pending_sample = None
+            if req in self.pending_sample_reqs:
+                self.pending_sample_reqs.remove(req)
+
+        self.process_batch_result(batch, result)
+        self._maybe_admit_sampled_batch(active_batch)
 
     def run_pending_sample_stage(self) -> None:
         if not self.pending_sample_reqs:
@@ -3544,8 +3885,17 @@ class Scheduler(
         if not ready_reqs:
             return
 
-        ready_result_ids = {id(req.pending_sample.result) for req in ready_reqs}
+        processed_result_ids = self._run_ready_fused_sample_groups(
+            ready_reqs, pending_rids_snapshot, active_rids_snapshot
+        )
+        ready_result_ids = {
+            id(req.pending_sample.result)
+            for req in ready_reqs
+            if req.pending_sample is not None
+        }
         for result_id in list(ready_result_ids):
+            if result_id in processed_result_ids:
+                continue
             group_reqs = [
                 req
                 for req in self.pending_sample_reqs
@@ -3561,71 +3911,11 @@ class Scheduler(
                 continue
 
             pending = group_reqs[0].pending_sample
-            batch = pending.batch
             active_batch = pending.active_batch
             result = pending.result
-            forward_batch = pending.forward_batch
-            num_reqs = active_batch.req_pool_indices.numel()
 
-            if (
-                result.logits_output is not None
-                and result.logits_output.next_token_logits is not None
-                and result.logits_output.next_token_logits.shape[0]
-                != num_reqs
-                and forward_batch.forward_mode.is_extend()
-                and forward_batch.extend_start_loc is not None
-                and forward_batch.extend_seq_lens is not None
-            ):
-                last_token_indices = (
-                    forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
-                ).to(result.logits_output.next_token_logits.device)
-                result.logits_output.next_token_logits = (
-                    result.logits_output.next_token_logits[last_token_indices]
-                )
-                if result.logits_output.hidden_states is not None:
-                    result.logits_output.hidden_states = result.logits_output.hidden_states[
-                        last_token_indices
-                    ]
-
-            result.next_token_ids = self.model_worker.model_runner.sample(
-                result.logits_output, forward_batch
-            )
-            if (
-                result.next_token_ids is not None
-                and result.next_token_ids.numel() != num_reqs
-            ):
-                if (
-                    forward_batch.forward_mode.is_extend()
-                    and forward_batch.extend_start_loc is not None
-                    and forward_batch.extend_seq_lens is not None
-                ):
-                    last_token_indices = (
-                        forward_batch.extend_start_loc
-                        + forward_batch.extend_seq_lens
-                        - 1
-                    ).to(result.next_token_ids.device)
-                else:
-                    last_token_indices = torch.full(
-                        (num_reqs,),
-                        result.next_token_ids.numel() - 1,
-                        dtype=torch.long,
-                        device=result.next_token_ids.device,
-                    )
-                result.next_token_ids = result.next_token_ids[last_token_indices]
-            self._relay_forward_payload(active_batch.req_pool_indices, result)
-            active_batch.input_ids = None
-            active_batch.is_extend_in_batch = False
-            active_batch.all_extend_in_batch = False
-            result.pending_sample = False
-            result.forward_batch = None
-
-            for req in group_reqs:
-                req.pending_sample = None
-                if req in self.pending_sample_reqs:
-                    self.pending_sample_reqs.remove(req)
-
-            self.process_batch_result(batch, result)
-            self._maybe_admit_sampled_batch(active_batch)
+            self._sample_pending_result_in_place(pending)
+            self._finalize_pending_sample_result(group_reqs)
 
     def _maybe_admit_sampled_batch(self, batch: ScheduleBatch) -> None:
         if batch.is_empty():

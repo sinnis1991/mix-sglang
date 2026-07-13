@@ -670,6 +670,9 @@ class PendingSample:
     result: Any
     forward_batch: Any
     wait_for_rids: Optional[Set[str]] = None
+    sample_group: Optional[str] = None
+    fuse_method: Optional[str] = None
+    fuse_weight: float = 1.0
     external_params_required: bool = False
     external_params: Optional[Dict[str, Any]] = None
 
