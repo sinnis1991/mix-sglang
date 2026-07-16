@@ -3645,6 +3645,63 @@ class Scheduler(
         # when fused-group sampling params intentionally diverge.
         return torch.multinomial(fused_probs, num_samples=1).view(1).to(torch.int32)
 
+    def _sync_pds_sampled_token(
+        self, sampled_token: Optional[torch.Tensor], device: torch.device
+    ) -> torch.Tensor:
+        if not (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and self.dp_tp_cpu_group is not None
+        ):
+            assert sampled_token is not None
+            return sampled_token
+
+        try:
+            group_world_size = torch.distributed.get_world_size(
+                group=self.dp_tp_cpu_group
+            )
+        except Exception:
+            assert sampled_token is not None
+            return sampled_token
+        if group_world_size <= 1:
+            assert sampled_token is not None
+            return sampled_token
+
+        token_obj = (
+            int(sampled_token.item())
+            if self.dp_tp_group.rank_in_group == 0 and sampled_token is not None
+            else None
+        )
+        obj_list = [token_obj]
+        torch.distributed.broadcast_object_list(
+            obj_list,
+            src=self.dp_tp_group.first_rank,
+            group=self.dp_tp_cpu_group,
+        )
+        return torch.tensor([obj_list[0]], dtype=torch.int32, device=device)
+
+    def _sample_synced_from_fused_probs(
+        self, fused_probs: torch.Tensor, reqs: List[Req]
+    ) -> torch.Tensor:
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and self.dp_tp_cpu_group is not None
+        ):
+            try:
+                group_world_size = torch.distributed.get_world_size(
+                    group=self.dp_tp_cpu_group
+                )
+            except Exception:
+                group_world_size = 1
+        else:
+            group_world_size = 1
+
+        sampled_token = None
+        if group_world_size <= 1 or self.dp_tp_group.rank_in_group == 0:
+            sampled_token = self._sample_from_fused_probs(fused_probs, reqs)
+        return self._sync_pds_sampled_token(sampled_token, fused_probs.device)
+
     def _run_fused_pending_sample_group(self, group_reqs: List[Req]) -> Set[int]:
         if len(group_reqs) < 2:
             return set()
@@ -3679,7 +3736,7 @@ class Scheduler(
             weight_sum = weight_tensor.sum()
         fused_probs = (probs * weight_tensor).sum(dim=0) / weight_sum
         fused_probs = fused_probs / fused_probs.sum()
-        sampled_token = self._sample_from_fused_probs(fused_probs, group_reqs)
+        sampled_token = self._sample_synced_from_fused_probs(fused_probs, group_reqs)
 
         for result_id, result_reqs in result_reqs_by_id.items():
             result = result_reqs[0].pending_sample.result
@@ -3744,7 +3801,7 @@ class Scheduler(
             and req.pending_sample.sample_group
             and req.pending_sample.fuse_method == "avg_probs"
         }
-        for sample_group in candidate_groups:
+        for sample_group in sorted(candidate_groups):
             group_reqs = [
                 req
                 for req in self.pending_sample_reqs
@@ -3809,7 +3866,7 @@ class Scheduler(
                 weight_sum = weight_tensor.sum()
             fused_probs = (probs * weight_tensor).sum(dim=0) / weight_sum
             fused_probs = fused_probs / fused_probs.sum()
-            sampled_tokens[sample_group] = self._sample_from_fused_probs(
+            sampled_tokens[sample_group] = self._sample_synced_from_fused_probs(
                 fused_probs, group_reqs
             )
 
