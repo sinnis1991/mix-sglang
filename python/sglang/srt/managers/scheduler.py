@@ -287,8 +287,11 @@ else:
 logger = logging.getLogger(__name__)
 
 PDS_RETURN_PROB_TRAJECTORY_KEY = "__pds_return_prob_trajectory"
+PDS_RETURN_TOP_K_KEY = "__pds_return_top_k"
 PDS_SOURCE_TOKEN_PROBS_KEY = "pds_source_token_probs"
 PDS_FUSED_TOKEN_PROBS_KEY = "pds_fused_token_probs"
+PDS_SOURCE_TOP_K_KEY = "pds_source_top_k"
+PDS_FUSED_TOP_K_KEY = "pds_fused_top_k"
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -3713,7 +3716,7 @@ class Scheduler(
         fused_probs: torch.Tensor,
         sampled_token: torch.Tensor,
     ) -> None:
-        """Record selected-token probabilities for opted-in fused requests.
+        """Record requested probability outputs for opted-in fused requests.
 
         The source probability is taken from the request's filtered distribution,
         which is the exact distribution that participates in fusion. The fused
@@ -3722,32 +3725,71 @@ class Scheduler(
         opted_in = []
         for req, source_probs in zip(group_reqs, distributions):
             custom_params = req.sampling_params.custom_params
-            if isinstance(custom_params, dict) and bool(
+            if not isinstance(custom_params, dict):
+                continue
+            return_selected_prob = bool(
                 custom_params.get(PDS_RETURN_PROB_TRAJECTORY_KEY, False)
+            )
+            requested_top_k = custom_params.get(PDS_RETURN_TOP_K_KEY, 0)
+            if isinstance(requested_top_k, bool) or not isinstance(
+                requested_top_k, int
             ):
-                opted_in.append((req, source_probs))
+                requested_top_k = 0
+            requested_top_k = max(requested_top_k, 0)
+            if return_selected_prob or requested_top_k > 0:
+                opted_in.append(
+                    (req, source_probs, return_selected_prob, requested_top_k)
+                )
 
         if not opted_in:
             return
 
         token_index = sampled_token.reshape(-1)[0].to(torch.long)
         fused_token_prob = fused_probs[token_index]
-        for req, source_probs in opted_in:
-            source_token_prob, fused_prob = (
-                torch.stack((source_probs[token_index], fused_token_prob))
-                .detach()
-                .float()
-                .cpu()
-                .tolist()
-            )
+        fused_top_k_cache = {}
+        for req, source_probs, return_selected_prob, requested_top_k in opted_in:
             if req.customized_info is None:
                 req.customized_info = {}
-            req.customized_info.setdefault(PDS_SOURCE_TOKEN_PROBS_KEY, []).append(
-                source_token_prob
-            )
-            req.customized_info.setdefault(PDS_FUSED_TOKEN_PROBS_KEY, []).append(
-                fused_prob
-            )
+            if return_selected_prob:
+                source_token_prob, fused_prob = (
+                    torch.stack((source_probs[token_index], fused_token_prob))
+                    .detach()
+                    .float()
+                    .cpu()
+                    .tolist()
+                )
+                req.customized_info.setdefault(
+                    PDS_SOURCE_TOKEN_PROBS_KEY, []
+                ).append(source_token_prob)
+                req.customized_info.setdefault(
+                    PDS_FUSED_TOKEN_PROBS_KEY, []
+                ).append(fused_prob)
+
+            if requested_top_k > 0:
+                top_k = min(requested_top_k, source_probs.numel())
+                source_values, source_indices = torch.topk(source_probs, top_k)
+                source_values = source_values.detach().float().cpu().tolist()
+                source_indices = source_indices.detach().cpu().tolist()
+                source_top_k = [
+                    {"token_id": token_id, "prob": prob}
+                    for token_id, prob in zip(source_indices, source_values)
+                ]
+
+                if top_k not in fused_top_k_cache:
+                    fused_values, fused_indices = torch.topk(fused_probs, top_k)
+                    fused_values = fused_values.detach().float().cpu().tolist()
+                    fused_indices = fused_indices.detach().cpu().tolist()
+                    fused_top_k_cache[top_k] = [
+                        {"token_id": token_id, "prob": prob}
+                        for token_id, prob in zip(fused_indices, fused_values)
+                    ]
+
+                req.customized_info.setdefault(PDS_SOURCE_TOP_K_KEY, []).append(
+                    source_top_k
+                )
+                req.customized_info.setdefault(PDS_FUSED_TOP_K_KEY, []).append(
+                    fused_top_k_cache[top_k]
+                )
 
     def _run_fused_pending_sample_group(self, group_reqs: List[Req]) -> Set[int]:
         if len(group_reqs) < 2:

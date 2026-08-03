@@ -79,18 +79,27 @@ request in with `__pds_return_prob_trajectory=true`:
   "custom_params": {
     "__pds_sample_group": "group_1",
     "__pds_fuse_method": "avg_probs",
-    "__pds_return_prob_trajectory": true
+    "__pds_return_prob_trajectory": true,
+    "__pds_return_top_k": 5
   }
 }
 ```
 
-The response `meta_info` then contains two arrays aligned one-to-one with
-`output_ids`:
+Depending on the requested options, the response `meta_info` contains the
+following arrays aligned one-to-one with `output_ids`:
 
 - `pds_source_token_probs`: the probability of each emitted token under this
   request's filtered source distribution.
 - `pds_fused_token_probs`: the probability of the same token under the fused
   distribution used for sampling.
+- `pds_source_top_k`: the source distribution's top-K entries for every emitted
+  token, represented as `{"token_id": ..., "prob": ...}` objects.
+- `pds_fused_top_k`: the fused distribution's top-K entries in the same format.
+
+`__pds_return_top_k` is independent of `__pds_return_prob_trajectory`: callers
+may request either output or both. K must be a positive integer and is capped at
+the model vocabulary size. Both top-K outputs use the filtered probability
+distributions that actually participate in fusion and sampling.
 
 Requests in the same group that do not opt in carry no probability values. In a
 mixed output batch, their corresponding customized-info entries are empty so
