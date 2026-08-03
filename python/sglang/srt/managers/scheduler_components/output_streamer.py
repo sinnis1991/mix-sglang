@@ -320,6 +320,22 @@ class _GenerationStreamAccumulator:
             self.output_token_ids_logprobs_val = []
             self.output_token_ids_logprobs_idx = []
 
+    def _collect_customized_info(
+        self, req: Req, send_token_offset: int, output_len: int
+    ) -> None:
+        req_customized_info = req.customized_info or {}
+        current_req_index = len(self.rids) - 1
+
+        for key, values in req_customized_info.items():
+            if key not in self.customized_info:
+                self.customized_info[key] = [[] for _ in range(current_req_index)]
+            self.customized_info[key].append(
+                values[send_token_offset:output_len]
+            )
+
+        for key in self.customized_info.keys() - req_customized_info.keys():
+            self.customized_info[key].append([])
+
     def accept(self, *, req: Req) -> None:
         if req.finished():
             assert not req.finished_output
@@ -499,11 +515,7 @@ class _GenerationStreamAccumulator:
                 req.indexer_topk if req.return_indexer_topk else None
             )
 
-        if req.customized_info is not None:
-            for k, v in req.customized_info.items():
-                if k not in self.customized_info:
-                    self.customized_info[k] = []
-                self.customized_info[k].append(v[send_token_offset : len(output_ids_)])
+        self._collect_customized_info(req, send_token_offset, len(output_ids_))
 
     def to_payload(
         self, *, dp_rank: int, is_idle_batch: bool

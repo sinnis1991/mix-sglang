@@ -286,6 +286,10 @@ else:
 
 logger = logging.getLogger(__name__)
 
+PDS_RETURN_PROB_TRAJECTORY_KEY = "__pds_return_prob_trajectory"
+PDS_SOURCE_TOKEN_PROBS_KEY = "pds_source_token_probs"
+PDS_FUSED_TOKEN_PROBS_KEY = "pds_fused_token_probs"
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
@@ -3702,6 +3706,49 @@ class Scheduler(
             sampled_token = self._sample_from_fused_probs(fused_probs, reqs)
         return self._sync_pds_sampled_token(sampled_token, fused_probs.device)
 
+    def _record_pds_prob_trajectories(
+        self,
+        group_reqs: List[Req],
+        distributions: List[torch.Tensor],
+        fused_probs: torch.Tensor,
+        sampled_token: torch.Tensor,
+    ) -> None:
+        """Record selected-token probabilities for opted-in fused requests.
+
+        The source probability is taken from the request's filtered distribution,
+        which is the exact distribution that participates in fusion. The fused
+        probability is taken from the distribution used to sample the shared token.
+        """
+        opted_in = []
+        for req, source_probs in zip(group_reqs, distributions):
+            custom_params = req.sampling_params.custom_params
+            if isinstance(custom_params, dict) and bool(
+                custom_params.get(PDS_RETURN_PROB_TRAJECTORY_KEY, False)
+            ):
+                opted_in.append((req, source_probs))
+
+        if not opted_in:
+            return
+
+        token_index = sampled_token.reshape(-1)[0].to(torch.long)
+        fused_token_prob = fused_probs[token_index]
+        for req, source_probs in opted_in:
+            source_token_prob, fused_prob = (
+                torch.stack((source_probs[token_index], fused_token_prob))
+                .detach()
+                .float()
+                .cpu()
+                .tolist()
+            )
+            if req.customized_info is None:
+                req.customized_info = {}
+            req.customized_info.setdefault(PDS_SOURCE_TOKEN_PROBS_KEY, []).append(
+                source_token_prob
+            )
+            req.customized_info.setdefault(PDS_FUSED_TOKEN_PROBS_KEY, []).append(
+                fused_prob
+            )
+
     def _run_fused_pending_sample_group(self, group_reqs: List[Req]) -> Set[int]:
         if len(group_reqs) < 2:
             return set()
@@ -3866,9 +3913,13 @@ class Scheduler(
                 weight_sum = weight_tensor.sum()
             fused_probs = (probs * weight_tensor).sum(dim=0) / weight_sum
             fused_probs = fused_probs / fused_probs.sum()
-            sampled_tokens[sample_group] = self._sample_synced_from_fused_probs(
+            sampled_token = self._sample_synced_from_fused_probs(
                 fused_probs, group_reqs
             )
+            self._record_pds_prob_trajectories(
+                group_reqs, distributions, fused_probs, sampled_token
+            )
+            sampled_tokens[sample_group] = sampled_token
 
         if not sampled_tokens:
             return processed_result_ids

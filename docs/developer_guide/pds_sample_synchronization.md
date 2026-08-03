@@ -71,6 +71,31 @@ The optional `__pds_fuse_weight` key can assign a scalar weight to a request.
 When no weight is provided, the default is `1.0`, so a two-request group uses a
 plain average.
 
+To return selected-token probability trajectories on one request, opt that
+request in with `__pds_return_prob_trajectory=true`:
+
+```json
+{
+  "custom_params": {
+    "__pds_sample_group": "group_1",
+    "__pds_fuse_method": "avg_probs",
+    "__pds_return_prob_trajectory": true
+  }
+}
+```
+
+The response `meta_info` then contains two arrays aligned one-to-one with
+`output_ids`:
+
+- `pds_source_token_probs`: the probability of each emitted token under this
+  request's filtered source distribution.
+- `pds_fused_token_probs`: the probability of the same token under the fused
+  distribution used for sampling.
+
+Requests in the same group that do not opt in carry no probability values. In a
+mixed output batch, their corresponding customized-info entries are empty so
+the scheduler-to-tokenizer batch indices remain aligned.
+
 ## Relevant Files
 
 - `python/sglang/srt/managers/scheduler.py`
