@@ -1,95 +1,145 @@
-<div align="center" id="sglangtop">
-<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
+<div align="center" id="mix-sglang-top">
 
-[![PyPI](https://img.shields.io/pypi/v/sglang)](https://pypi.org/project/sglang)
-![PyPI - Downloads](https://static.pepy.tech/badge/sglang?period=month)
-[![license](https://img.shields.io/github/license/sgl-project/sglang.svg)](https://github.com/sgl-project/sglang/tree/main/LICENSE)
-[![issue resolution](https://img.shields.io/github/issues-closed-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
-[![open issues](https://img.shields.io/github/issues-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/sgl-project/sglang)
+<img src="assets/mix-sglang-cover.png" alt="mix-sglang" width="720">
+
+### Coordinated and fused sampling for SGLang
+
+[SGLang Documentation](https://docs.sglang.io/) · [PDS Design](docs/developer_guide/pds_sample_synchronization.md) · [Windows PDS Runbook](docs/developer_guide/windows_pds_inference_runbook.md)
 
 </div>
 
---------------------------------------------------------------------------------
+> [!IMPORTANT]
+> mix-sglang is an experimental research fork of [SGLang](https://github.com/sgl-project/sglang). The PDS request parameters described below are temporary and are not yet a stable public API.
 
-<p align="center">
-<a href="https://lmsys.org/blog/"><b>Blog</b></a> |
-<a href="https://docs.sglang.io/"><b>Documentation</b></a> |
-<a href="https://roadmap.sglang.io/"><b>Roadmap</b></a> |
-<a href="https://slack.sglang.io/"><b>Join Slack</b></a> |
-<a href="https://meet.sglang.io/"><b>Weekly Dev Meeting</b></a> |
-<a href="https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides"><b>Slides</b></a>
-</p>
+## What We Are Building
 
-## News
-- [2026/06] 🔥 The next generation of speculative decoding: DFlash and Spec V2 ([blog](https://lmsys.org/blog/2026-06-15-next-generation-speculative-decoding-dflash-v2/)).
-- [2026/04] 🔥 DeepSeek-V4 on Day 0: From Fast Inference to Verified RL with SGLang and Miles ([blog](https://lmsys.org/blog/2026-04-25-deepseek-v4/)).
-- [2026/06] SGLang provides day-0 support for latest open models ([Nemotron 3 Ultra](https://lmsys.org/blog/2026-06-04-nvidia-run-nemotron-3-ultra/), [Nemotron 3 Super](https://lmsys.org/blog/2026-03-11-run-nvidia-nemotron-3-super/), [Higgs Audio v3 TTS](https://lmsys.org/blog/2026-06-04-higgs-audio-v3-tts/)).
-- [2026/02] 🔥 Unlocking 25x Inference Performance with SGLang on NVIDIA GB300 NVL72 ([blog](https://lmsys.org/blog/2026-02-20-gb300-inferencex/)).
-- [2026/01] SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2026-01-16-sglang-diffusion/)).
-- [2025/12] SGLang provides day-0 support for latest open models ([MiMo-V2-Flash](https://lmsys.org/blog/2025-12-16-mimo-v2-flash/), [Nemotron 3 Nano](https://lmsys.org/blog/2025-12-15-run-nvidia-nemotron-3-nano/), [Mistral Large 3](https://github.com/sgl-project/sglang/pull/14213), [LLaDA 2.0 Diffusion LLM](https://lmsys.org/blog/2025-12-19-diffusion-llm/), [MiniMax M2](https://lmsys.org/blog/2025-11-04-miminmax-m2/)).
-- [2025/10] SGLang now runs natively on TPU with the SGLang-Jax backend ([blog](https://lmsys.org/blog/2025-10-29-sglang-jax/)).
+We are developing **prefill/decode/sample separation (PDS)** for SGLang. In a normal inference loop, each request samples a token as soon as its model forward pass produces logits. mix-sglang makes sampling an explicit scheduler stage: logits can be parked, coordinated with other requests, fused, and sampled later without blocking the rest of the server.
 
-<details>
-<summary>More</summary>
+This separation lets multiple concurrent generations collaborate at token level. Each request can contribute its own filtered probability distribution; mix-sglang combines those distributions, samples one token, and advances every request in the group with that same token. The result is a practical foundation for experiments in multi-prompt generation, distribution-level model mixing, synchronized decoding, and sampling-time control.
 
-- [2025/09] Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP (Part II): 3.8x Prefill, 4.8x Decode Throughput ([blog](https://lmsys.org/blog/2025-09-25-gb200-part-2/)).
-- [2025/09] SGLang Day 0 Support for DeepSeek-V3.2 with Sparse Attention ([blog](https://lmsys.org/blog/2025-09-29-deepseek-V32/)).
-- [2025/08] SGLang x AMD SF Meetup on 8/22: Hands-on GPU workshop, tech talks by AMD/xAI/SGLang, and networking ([Roadmap](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_roadmap.pdf), [Large-scale EP](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_ep.pdf), [Highlights](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_highlights.pdf), [AITER/MoRI](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_aiter_mori.pdf), [Wave](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_wave.pdf)).
+## Main Features
 
-- [2025/11] SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2025-11-07-sglang-diffusion/)).
-- [2025/10] PyTorch Conference 2025 SGLang Talk ([slide](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/sglang_pytorch_2025.pdf)).
-- [2025/10] SGLang x Nvidia SF Meetup on 10/2 ([recap](https://x.com/lmsysorg/status/1975339501934510231)).
-- [2025/08] SGLang provides day-0 support for OpenAI gpt-oss model ([instructions](https://github.com/sgl-project/sglang/issues/8833))
-- [2025/06] SGLang, the high-performance serving infrastructure powering trillions of tokens daily, has been awarded the third batch of the Open Source AI Grant by a16z ([a16z blog](https://a16z.com/advancing-open-source-ai-through-benchmarks-and-bold-experimentation/)).
-- [2025/05] Deploying DeepSeek with PD Disaggregation and Large-scale Expert Parallelism on 96 H100 GPUs ([blog](https://lmsys.org/blog/2025-05-05-large-scale-ep/)).
-- [2025/06] Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP (Part I): 2.7x Higher Decoding Throughput ([blog](https://lmsys.org/blog/2025-06-16-gb200-part-1/)).
-- [2025/03] Supercharge DeepSeek-R1 Inference on AMD Instinct MI300X ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1-Part2/README.html))
-- [2025/03] SGLang Joins PyTorch Ecosystem: Efficient LLM Serving Engine ([PyTorch blog](https://pytorch.org/blog/sglang-joins-pytorch/))
-- [2025/02] Unlock DeepSeek-R1 Inference Performance on AMD Instinct™ MI300X GPU ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1_Perf/README.html))
-- [2025/01] SGLang provides day one support for DeepSeek V3/R1 models on NVIDIA and AMD GPUs with DeepSeek-specific optimizations. ([instructions](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3), [AMD blog](https://www.amd.com/en/developer/resources/technical-articles/amd-instinct-gpus-power-deepseek-v3-revolutionizing-ai-development-with-sglang.html), [10+ other companies](https://x.com/lmsysorg/status/1887262321636221412))
-- [2024/12] v0.4 Release: Zero-Overhead Batch Scheduler, Cache-Aware Load Balancer, Faster Structured Outputs ([blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/)).
-- [2024/10] The First SGLang Online Meetup ([slides](https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#the-first-sglang-online-meetup)).
-- [2024/09] v0.3 Release: 7x Faster DeepSeek MLA, 1.5x Faster torch.compile, Multi-Image/Video LLaVA-OneVision ([blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/)).
-- [2024/07] v0.2 Release: Faster Llama3 Serving with SGLang Runtime (vs. TensorRT-LLM, vLLM) ([blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/)).
-- [2024/02] SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
-- [2024/01] SGLang provides up to **5x faster inference** with RadixAttention ([blog](https://lmsys.org/blog/2024-01-17-sglang/)).
-- [2024/01] SGLang powers the serving of the official **LLaVA v1.6** release demo ([usage](https://github.com/haotian-liu/LLaVA?tab=readme-ov-file#demo)).
+- **Deferred sampling** — model forward passes produce logits with sampling disabled, and the scheduler safely resumes the requests when their sampling conditions are satisfied.
+- **Request synchronization** — a request can wait for selected live request IDs before taking its next sample, without deadlocking on requests that have already finished.
+- **Distribution fusion** — requests in the same sample group can combine their filtered token distributions with `avg_probs`. Optional per-request weights support weighted mixtures.
+- **Shared-token generation** — a fused group samples once and writes the same token back to every member, keeping output IDs, sequence lengths, KV-cache progression, and streamed results aligned.
+- **Tensor-parallel consistency** — fused sampling is performed once by the TP leader and broadcast to the other ranks so all workers advance with identical state.
+- **Probability trajectories** — opted-in requests can return the selected token's probability under both the request's source distribution and the fused distribution.
+- **Concurrent and staggered groups** — the scheduler handles multiple groups sharing a forward batch, as well as group members whose logits become ready at different times.
+- **SGLang serving foundation** — the project retains SGLang's high-throughput runtime, continuous batching, prefix caching, distributed execution, broad model support, and OpenAI-compatible serving interfaces.
 
-</details>
+## How PDS Works
 
-## About
-SGLang is a high-performance serving framework for large language models and multimodal models.
-It is designed to deliver low-latency and high-throughput inference across a wide range of setups, from a single GPU to large distributed clusters.
-Its core features include:
+For each decoding step, a request moves through the following path:
 
-- **Fast Runtime**: Provides efficient serving with RadixAttention for prefix caching, a zero-overhead CPU scheduler, prefill-decode disaggregation, speculative decoding, continuous batching, paged attention, tensor/pipeline/expert/data parallelism, structured outputs, chunked prefill, quantization (FP4/FP8/INT4/AWQ/GPTQ), and multi-LoRA batching.
-- **Broad Model Support**: Supports a wide range of language models (Llama, Qwen, DeepSeek, Kimi, GLM, GPT, Gemma, Mistral, etc.), embedding models (e5-mistral, gte, mcdse), reward models (Skywork), and diffusion models (WAN, Qwen-Image), with easy extensibility for adding new models. Compatible with most Hugging Face models and OpenAI APIs.
-- **Extensive Hardware Support**: Runs on NVIDIA GPUs (GB200/B300/H100/A100/Spark/5090), AMD GPUs (MI355/MI300), Intel Xeon CPUs, Google TPUs, Ascend NPUs, and more.
-- **Active Community**: SGLang is open-source and supported by a vibrant community with widespread industry adoption, powering over 400,000 GPUs worldwide.
-- **RL & Post-Training Backbone**: SGLang is a proven rollout backend used for training many frontier models, with native RL integrations and adoption by well-known post-training frameworks such as [**AReaL**](https://github.com/inclusionAI/AReaL), [**Miles**](https://github.com/radixark/miles), [**slime**](https://github.com/THUDM/slime), [**Tunix**](https://github.com/google/tunix), [**verl**](https://github.com/volcengine/verl) and more.
+1. The model forward pass computes logits with immediate sampling disabled.
+2. The scheduler stores the result as pending sampling work.
+3. PDS waits until the request's live dependencies or sample-group members are ready.
+4. Each request's temperature and top-k/top-p/min-p rules produce a normalized source distribution.
+5. The scheduler combines the distributions and samples one token from the fused result.
+6. That token is propagated through SGLang's normal result-processing and decode-admission paths.
+
+For two equally weighted requests, the current fusion rule is:
+
+```text
+p_a = normalize(filter(logits_a, sampling_params_a))
+p_b = normalize(filter(logits_b, sampling_params_b))
+p_fused = (p_a + p_b) / 2
+next_token ~ p_fused
+```
+
+The implementation averages probabilities, not raw logits.
+
+## Request Example
+
+Send the requests concurrently and give them the same sample-group name:
+
+```json
+{
+  "rid": "mix_math",
+  "text": "What is 1 + 1?",
+  "sampling_params": {
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "max_new_tokens": 128,
+    "custom_params": {
+      "__pds_sample_group": "math_poem",
+      "__pds_fuse_method": "avg_probs",
+      "__pds_fuse_weight": 1.0,
+      "__pds_return_prob_trajectory": true
+    }
+  }
+}
+```
+
+```json
+{
+  "rid": "mix_poem",
+  "text": "Write a short classical poem.",
+  "sampling_params": {
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "max_new_tokens": 128,
+    "custom_params": {
+      "__pds_sample_group": "math_poem",
+      "__pds_fuse_method": "avg_probs",
+      "__pds_fuse_weight": 1.0
+    }
+  }
+}
+```
+
+Both requests should receive identical output token IDs. The first response also includes two arrays in `meta_info`, aligned with `output_ids`:
+
+- `pds_source_token_probs`
+- `pds_fused_token_probs`
+
+For request-ID synchronization without distribution fusion, use `__pds_wait_for_rids` instead.
 
 ## Getting Started
+
+mix-sglang follows the standard SGLang installation and server interfaces. Start with the upstream guides, then use the PDS-specific request parameters above:
+
 - [Install SGLang](https://docs.sglang.io/get_started/install.html)
-- [Quick Start](https://docs.sglang.io/basic_usage/send_request.html)
-- [Backend Tutorial](https://docs.sglang.io/basic_usage/openai_api_completions.html)
-- [Frontend Tutorial](https://docs.sglang.io/references/frontend/frontend_tutorial.html)
-- [Contribution Guide](https://docs.sglang.io/developer_guide/contribution_guide.html)
+- [SGLang Quick Start](https://docs.sglang.io/basic_usage/send_request.html)
+- [OpenAI-Compatible APIs](https://docs.sglang.io/basic_usage/openai_api_completions.html)
 
-## Benchmark and Performance
-Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/), [Large-scale expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/), [GB200 rack-scale parallelism](https://lmsys.org/blog/2025-09-25-gb200-part-2/), [GB300 long context](https://lmsys.org/blog/2026-02-19-gb300-longctx/).
+For the tested local Windows workflow in this repository:
 
-## Adoption and Sponsorship
-SGLang has been deployed at large scale, generating trillions of tokens in production each day. It is trusted and adopted by a wide range of leading enterprises and institutions, including xAI, AMD, NVIDIA, Intel, LinkedIn, Cursor, Oracle Cloud, Google Cloud, Microsoft Azure, AWS, Atlas Cloud, Voltage Park, Nebius, DataCrunch, Novita, InnoMatrix, Modal, MIT, UCLA, the University of Washington, Stanford, UC Berkeley, Tsinghua University, Jam & Tea Studios, Baseten, and other major technology organizations.
-As an open-source LLM inference engine, SGLang has become the de facto industry standard, with deployments running on over 400,000 GPUs worldwide.
-SGLang is currently hosted under the non-profit open-source organization [LMSYS](https://lmsys.org/about/).
+```powershell
+.\scripts\pds\start_mix_pds_local.ps1
 
-<img src="https://raw.githubusercontent.com/sgl-project/sgl-learning-materials/refs/heads/main/slides/adoption.png" alt="logo" width="800" margin="10px"></img>
+$env:MIX_PDS_API_KEY = (Get-Content .tmp_pds_run\mix_pds_local_api_key.txt -Raw).Trim()
+python scripts\pds\smoke_mix_pds_stream.py
 
-## Contact Us
-For enterprises interested in adopting or deploying SGLang at scale, including technical consulting, sponsorship opportunities, or partnership inquiries, please contact us at [sglang@lmsys.org](mailto:sglang@lmsys.org).
+.\scripts\pds\stop_mix_pds_local.ps1
+```
 
-Long-term active SGLang contributors are eligible for coding agent sponsorship, such as Cursor, Claude Code, or OpenAI Codex. Email [sglang@lmsys.org](mailto:sglang@lmsys.org) with your most important commits or pull requests.
+The scripts accept model, Python, host, and port overrides. See the [Windows PDS inference runbook](docs/developer_guide/windows_pds_inference_runbook.md) for the complete environment setup and troubleshooting notes.
 
-## Acknowledgment
-We learned the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
+## Project Status and Limitations
+
+The current implementation is intended for research and validation:
+
+- `avg_probs` is the only distribution-fusion method currently implemented.
+- PDS controls live under temporary `sampling_params.custom_params` keys.
+- Group members should use compatible vocabularies and sampling configurations.
+- The Python-level fusion path prioritizes correctness and debuggability; a dedicated kernel path is future work.
+- API stability, performance tuning, broader backend coverage, and more fusion policies are still in progress.
+
+## Documentation
+
+- [PDS sample synchronization and distribution fusion](docs/developer_guide/pds_sample_synchronization.md) — design, scheduler state machine, request API, failure modes, and verification.
+- [Windows PDS inference runbook](docs/developer_guide/windows_pds_inference_runbook.md) — reproducible local launch, paired-request tests, and process cleanup.
+
+## Upstream SGLang
+
+mix-sglang is built on SGLang, a high-performance serving framework for large language and multimodal models. SGLang provides the production runtime, model integrations, hardware backends, distributed execution, and serving APIs on which this research is based.
+
+For the full upstream feature set, community resources, benchmarks, and contribution guide, visit the [SGLang repository](https://github.com/sgl-project/sglang) and [documentation](https://docs.sglang.io/).
+
+## Acknowledgments
+
+We thank the SGLang contributors and the projects that shaped its design, including [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).

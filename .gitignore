@@ -186,6 +186,7 @@ tl_out/
 # Plots
 *.png
 *.pdf
+!assets/mix-sglang-cover.png
 
 # personnal
 work_dirs/
